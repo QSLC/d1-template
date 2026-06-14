@@ -1,5 +1,5 @@
 {
-	"compatibility_date": "2025-10-08",
+	"compatibility_date": "2026-06-14",
 	"main": "src/index.ts",
 	"name": "d1-template",
 	"upload_source_maps": true,
@@ -12,7 +12,23 @@
 	],
 	"observability": {
 		"enabled": true
+	},
+	"env": {
+		"production": {
+			"name": "d1-template-prod"
+		},
+		"staging": {
+			"name": "d1-template-staging"
+		}
+	},
+	"vars": {
+		"FRONTEND_URL": "https://localhost:3000"
+	},
+	"env_overrides": {
+		"production": {
+			"vars": {
+				"FRONTEND_URL": "https://yourdomain.com"
+			}
+		}
 	}
 }
-// wrangler.json
-"name": "dream-big",

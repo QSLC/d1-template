@@ -7,6 +7,7 @@ export function renderHtml(content: string) {
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>D1</title>
         <link rel="stylesheet" type="text/css" href="https://static.integrations.cloudflare.com/styles.css">
+        <script defer src="https://cdn.vercel-insights.com/v1/script.js"></script>
       </head>
     
       <body>

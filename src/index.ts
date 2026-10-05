@@ -36,7 +36,7 @@ class MyAgent {
     if (typeof value === 'string') return `'${value.replace(/'/g, "''")}'`;
     if (typeof value === 'number') return String(value);
     if (typeof value === 'boolean') return value ? '1' : '0';
-    return `'${JSON.stringify(value).replace(/'/g, "''')}'`;
+    return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
   }
 
   async init() {
@@ -91,10 +91,9 @@ class MyAgent {
   }
 
   async getUser(id: string) {
-    const rows = await this.sql<{ id: string; name: string; email?: string }>(
-      `SELECT * FROM users WHERE id = '${id}'`
-    );
-    return rows[0] ?? null;
+    return this.env.DB.prepare(
+      'SELECT id, name, email FROM users WHERE id = ?'
+    ).bind(id).first<{ id: string; name: string; email?: string }>();
   }
 
   async track(type: string, meta: any = {}) {
@@ -111,12 +110,12 @@ class MyAgent {
   }
 
   async checkKey(apiKey: string) {
-    const rows = await this.sql<{ api_key: string; tier: string; email: string }>(
-      `SELECT api_key, tier, email FROM api_keys WHERE api_key = '${apiKey}'`
-    );
-    if (!rows.length) return null;
-    this.state.tier = rows[0].tier;
-    return rows[0];
+    const row = await this.env.DB.prepare(
+      'SELECT api_key, tier, email FROM api_keys WHERE api_key = ?'
+    ).bind(apiKey).first<{ api_key: string; tier: string; email: string }>();
+    if (!row) return null;
+    this.state.tier = row.tier;
+    return row;
   }
 
   async onMessage(message: string) {
@@ -166,6 +165,10 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+export function purchaseAuditMessage(_email: string, _apiKey: string): string {
+  return 'Purchase recorded for verified checkout session';
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -174,19 +177,20 @@ export default {
       return cors();
     }
 
-    // Agent endpoint (optional API key check via header)
+    // Agent endpoint (API key required before any D1 access)
     if (url.pathname === '/agent' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({} as any));
-      const message = body.message ?? '';
-      const apiKey = request.headers.get('x-api-key') ?? body.apiKey ?? null;
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      const message = typeof body.message === 'string' ? body.message : '';
+      const bodyApiKey = typeof body.apiKey === 'string' ? body.apiKey : null;
+      const apiKey = request.headers.get('x-api-key') ?? bodyApiKey;
+
+      if (!apiKey) return withCors(json({ error: 'api_key_required' }, 401));
 
       const agent = new MyAgent(env, {});
       await agent.init();
 
-      if (apiKey) {
-        const keyRow = await agent.checkKey(apiKey);
-        if (!keyRow) return withCors(json({ error: 'invalid_api_key' }, 401));
-      }
+      const keyRow = await agent.checkKey(apiKey);
+      if (!keyRow) return withCors(json({ error: 'invalid_api_key' }, 401));
 
       const result = await agent.onMessage(message);
       return withCors(json(result));
@@ -194,10 +198,11 @@ export default {
 
     // Event tracking
     if (url.pathname === '/event' && request.method === 'POST') {
-      const body = await request.json().catch(() => ({} as any));
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      const eventType = typeof body.type === 'string' ? body.type : 'unknown';
       const agent = new MyAgent(env, {});
       await agent.init();
-      const result = await agent.track(body.type ?? 'unknown', body);
+      const result = await agent.track(eventType, body);
       return withCors(json(result));
     }
 
@@ -246,8 +251,8 @@ export default {
     if (url.pathname === '/checkout' && request.method === 'POST') {
       try {
         const stripe = new Stripe(env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' as any });
-        const body = await request.json().catch(() => ({} as any));
-        const tier = body.tier ?? 'prime';
+        const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+        const tier = typeof body.tier === 'string' ? body.tier : 'prime';
 
         const priceMap: Record<string, number> = {
           base: 10000, // $100
@@ -326,7 +331,7 @@ export default {
             .bind(apiKey, tier, email)
             .run();
 
-          console.log(`Purchase recorded: ${email} -> ${tier} (Key: ${apiKey})`);
+          console.log(purchaseAuditMessage(email, apiKey));
           // TODO: Deliver apiKey via secure email/portal, not response
         }
 

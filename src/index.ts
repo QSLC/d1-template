@@ -62,10 +62,10 @@ class MyAgent {
         email TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
-      `CREATE TABLE IF NOT EXISTS api_keys (
-        api_key TEXT PRIMARY KEY,
+      `CREATE TABLE IF NOT EXISTS api_credentials (
+        api_key_hash TEXT PRIMARY KEY,
+        stripe_session_id TEXT NOT NULL UNIQUE,
         tier TEXT NOT NULL,
-        email TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`
     ];
@@ -110,9 +110,10 @@ class MyAgent {
   }
 
   async checkKey(apiKey: string) {
+    const apiKeyHash = await sha256Hex(apiKey);
     const row = await this.env.DB.prepare(
-      'SELECT api_key, tier, email FROM api_keys WHERE api_key = ?'
-    ).bind(apiKey).first<{ api_key: string; tier: string; email: string }>();
+      'SELECT api_key_hash, tier FROM api_credentials WHERE api_key_hash = ?'
+    ).bind(apiKeyHash).first<{ api_key_hash: string; tier: string }>();
     if (!row) return null;
     this.state.tier = row.tier;
     return row;
@@ -167,6 +168,74 @@ function json(data: unknown, status = 200): Response {
 
 export function purchaseAuditMessage(_email: string, _apiKey: string): string {
   return 'Purchase recorded for verified checkout session';
+}
+
+type ClaimableCheckout = Pick<
+  Stripe.Checkout.Session,
+  'id' | 'status' | 'payment_status' | 'amount_total' | 'metadata'
+>;
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function generateApiKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  return `qslc_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let i = 0; i < left.length; i++) difference |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  return difference === 0;
+}
+
+export async function claimCredentialForCheckout(
+  env: Env,
+  session: ClaimableCheckout,
+  claimToken: string
+) {
+  if (session.status !== 'complete' || session.payment_status !== 'paid') {
+    return { status: 403, error: 'paid_checkout_required' } as const;
+  }
+
+  const priceMap: Record<string, number> = {
+    base: 10000,
+    sovereign: 25000,
+    prime: 50000
+  };
+  const tier = session.metadata?.tier ?? '';
+  if (!priceMap[tier] || session.amount_total !== priceMap[tier]) {
+    return { status: 400, error: 'checkout_details_invalid' } as const;
+  }
+  const expectedClaimHash = session.metadata?.credential_claim_hash ?? '';
+  const suppliedClaimHash = await sha256Hex(claimToken);
+  if (!/^[a-f0-9]{64}$/.test(expectedClaimHash) || !constantTimeEqual(expectedClaimHash, suppliedClaimHash)) {
+    return { status: 403, error: 'claim_token_invalid' } as const;
+  }
+
+  const existing = await env.DB.prepare(
+    'SELECT stripe_session_id FROM api_credentials WHERE stripe_session_id = ?'
+  ).bind(session.id).first<{ stripe_session_id: string }>();
+  if (existing) return { status: 409, error: 'credential_already_claimed' } as const;
+
+  const apiKey = generateApiKey();
+  const apiKeyHash = await sha256Hex(apiKey);
+  try {
+    await env.DB.prepare(
+      `INSERT INTO api_credentials (api_key_hash, stripe_session_id, tier, created_at)
+       VALUES (?, ?, ?, datetime('now'))`
+    ).bind(apiKeyHash, session.id, tier).run();
+  } catch (err: any) {
+    if (String(err?.message ?? err).toLowerCase().includes('unique')) {
+      return { status: 409, error: 'credential_already_claimed' } as const;
+    }
+    return { status: 500, error: 'credential_storage_failed' } as const;
+  }
+
+  return { status: 200, apiKey, tier } as const;
 }
 
 export default {
@@ -267,6 +336,12 @@ export default {
           prime: 'PRIME'
         };
 
+        const claimBytes = crypto.getRandomValues(new Uint8Array(32));
+        const claimToken = `qcl_${Array.from(claimBytes, (byte) =>
+          byte.toString(16).padStart(2, '0')
+        ).join('')}`;
+        const claimTokenHash = await sha256Hex(claimToken);
+
         const session = await stripe.checkout.sessions.create({
           mode: 'payment',
           payment_method_types: ['card'],
@@ -284,10 +359,10 @@ export default {
           ],
           success_url: `${env.FRONTEND_URL}/?success=1&session_id={CHECKOUT_SESSION_ID}`,
           cancel_url: `${env.FRONTEND_URL}/?canceled=1`,
-          metadata: { tier }
+          metadata: { tier, credential_claim_hash: claimTokenHash }
         });
 
-        return withCors(json({ url: session.url, session_id: session.id }));
+        return withCors(json({ url: session.url, session_id: session.id, claim_token: claimToken }));
       } catch (err: any) {
         return withCors(json({ error: err.message }, 400));
       }
@@ -320,19 +395,7 @@ export default {
             .bind(session.id, tier, amount, email)
             .run();
 
-          const apiKey =
-            'sk_' +
-            crypto.randomUUID().replace(/-/g, '').substring(0, 24);
-
-          await env.DB.prepare(
-            `INSERT INTO api_keys (api_key, tier, email, created_at)
-             VALUES (?, ?, ?, datetime('now'))`
-          )
-            .bind(apiKey, tier, email)
-            .run();
-
-          console.log(purchaseAuditMessage(email, apiKey));
-          // TODO: Deliver apiKey via secure email/portal, not response
+          console.log(purchaseAuditMessage(email, 'redacted'));
         }
 
         return new Response('OK', { status: 200 });
@@ -341,11 +404,34 @@ export default {
       }
     }
 
+    // One-time API credential claim after Stripe verifies the paid checkout.
+    if (url.pathname === '/claim-key' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+      const sessionId = typeof body.session_id === 'string' ? body.session_id : '';
+      const claimToken = typeof body.claim_token === 'string' ? body.claim_token : '';
+      if (!/^cs_[A-Za-z0-9_]{8,255}$/.test(sessionId)) {
+        return withCors(json({ error: 'valid_session_id_required' }, 400));
+      }
+      if (!/^qcl_[a-f0-9]{64}$/.test(claimToken)) {
+        return withCors(json({ error: 'valid_claim_token_required' }, 400));
+      }
+
+      try {
+        const stripe = new Stripe(env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' as any });
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        const result = await claimCredentialForCheckout(env, session, claimToken);
+        if ('error' in result) return withCors(json({ error: result.error }, result.status));
+        return withCors(json({ api_key: result.apiKey, tier: result.tier }, result.status));
+      } catch {
+        return withCors(json({ error: 'checkout_verification_failed' }, 400));
+      }
+    }
+
     // Health check
     if (url.pathname === '/health' && request.method === 'GET') {
       return withCors(json({ status: 'ok', timestamp: new Date().toISOString() }));
     }
 
-    return withCors(json({ error: 'Not found. Try /agent, /event, /checkout, /metrics, or /health' }, 404));
+    return withCors(json({ error: 'Not found. Try /agent, /event, /checkout, /claim-key, /metrics, or /health' }, 404));
   }
 } satisfies ExportedHandler<Env>;
